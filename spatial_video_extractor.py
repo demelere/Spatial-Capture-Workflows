@@ -1,143 +1,93 @@
 import av
 import numpy as np
-import rerun as rr
-from pathlib import Path
+import h5py
 import json
+import time
+import argparse
+from pathlib import Path
 
-class iPhoneSpatialVideoExtractor:
-    """Extract RGB and depth data from iPhone spatial videos"""
+class DepthExtractor:
+    """Extract depth data from iPhone spatial videos to HDF5 format"""
     
     def __init__(self, video_path):
-        self.container = av.open(video_path)
+        self.video_path = Path(video_path)
+        self.output_dir = self.video_path.parent / f"{self.video_path.stem}_depth_data"
+        self.output_dir.mkdir(exist_ok=True)
         
-        # Get video streams
-        self.streams = {
-            stream.type: stream
-            for stream in self.container.streams
-        }
+    def extract(self):
+        """Extract depth data and save to HDF5 file"""
+        print(f"Processing video: {self.video_path}")
         
-        # Print available streams for debugging
-        print("Available streams:")
-        for stream_type, stream in self.streams.items():
-            print(f"- {stream_type}: {stream.metadata}")
-    
-    def extract_frames(self):
-        """
-        Extract synchronized RGB and depth frames from the spatial video.
-        Returns RGB frames and depth maps that rerun can visualize.
-        """
-        # Get the main video stream
-        video_stream = self.streams.get('video')
-        if not video_stream:
-            raise ValueError("No video stream found")
-            
-        # Get the depth stream (could be named differently depending on iPhone format)
-        depth_stream = None
-        for stream in self.container.streams:
+        container = av.open(str(self.video_path)) # open the video file
+        
+        print("\nAvailable streams:") # print available streams
+        for i, stream in enumerate(container.streams):
+            print(f"Stream #{i}: {stream.type} - Metadata: {stream.metadata}")
+        
+        depth_stream = None # find depth stream
+        for stream in container.streams:
             if 'depth' in str(stream.metadata).lower():
                 depth_stream = stream
                 break
         
         if not depth_stream:
-            print("Warning: No depth stream found. Check if this is a spatial video.")
+            raise ValueError("No depth stream found in video")
             
-        # Prepare rerun logging
-        rr.init("iPhone Spatial Video Viewer")
-        rr.connect()
+        depth_file_path = self.output_dir / f"{self.video_path.stem}_depth.h5" # create HDF5 file for depth data
         
-        frame_count = 0
+        try:
+            with h5py.File(depth_file_path, 'w') as f:
+                depth_maps = f.create_group('depth_maps') # create datasets
+                f.create_dataset('timestamps', (0,), maxshape=(None,), dtype=np.int64)
+                
+                frame_count = 0
+                timestamps = []
+                
+                print("\nExtracting depth data...")
+                for packet in container.demux(depth_stream):
+                    for frame in packet.decode():
+                        depth_map = np.frombuffer(frame.planes[0], dtype=np.float32) # convert depth frame to numpy array
+                        depth_map = depth_map.reshape(frame.height, frame.width)
+                        
+                        depth_maps.create_dataset(
+                            f'frame_{frame_count}',
+                            data=depth_map,
+                            compression='gzip',
+                            compression_opts=9
+                        )
+                        
+                        timestamps.append(frame.pts) # store timestamp
+                        
+                        frame_count += 1
+                        if frame_count % 10 == 0:
+                            print(f"Processed {frame_count} frames")
+                
+                f['timestamps'].resize((len(timestamps),)) # save timestamps
+                f['timestamps'][:] = timestamps
+                
+                metadata = { # save metadata
+                    'video_path': str(self.video_path),
+                    'frame_count': frame_count,
+                    'width': frame.width,
+                    'height': frame.height,
+                    'extraction_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'depth_stream_metadata': str(depth_stream.metadata)
+                }
+                f.attrs['metadata'] = json.dumps(metadata)
         
-        # Dictionary to store depth maps keyed by timestamp
-        depth_maps = {}
-        
-        # First pass: collect depth data
-        if depth_stream:
-            for packet in self.container.demux(depth_stream):
-                for frame in packet.decode():
-                    # Convert depth frame to numpy array
-                    depth_map = np.frombuffer(frame.planes[0], dtype=np.float32)
-                    depth_map = depth_map.reshape(frame.height, frame.width)
-                    
-                    # Store with timestamp
-                    depth_maps[frame.pts] = depth_map
-        
-        # Reset container
-        self.container.seek(0)
-        
-        # Second pass: process RGB frames and match with depth
-        for frame in self.container.decode(video=0):
-            # Convert RGB frame
-            rgb_frame = frame.to_ndarray(format='rgb24')
+        finally:
+            container.close()
             
-            # Log RGB frame to rerun
-            rr.log("world/video", rr.Image(rgb_frame))
-            
-            # Find matching depth map
-            depth_map = depth_maps.get(frame.pts)
-            if depth_map is not None:
-                # Log depth visualization options
-                
-                # 1. As depth image
-                rr.log("world/depth/image", 
-                      rr.DepthImage(depth_map, meter=True))
-                
-                # 2. As point cloud
-                # Create point cloud from depth map
-                h, w = depth_map.shape
-                y, x = np.mgrid[0:h, 0:w]
-                
-                # Basic pinhole camera model (adjust parameters as needed)
-                fx = w  # approximate focal length
-                fy = h
-                cx = w / 2
-                cy = h / 2
-                
-                # Calculate 3D points
-                x_3d = (x - cx) * depth_map / fx
-                y_3d = (y - cy) * depth_map / fy
-                z_3d = depth_map
-                
-                # Stack points and reshape
-                points = np.stack([x_3d, y_3d, z_3d], axis=-1)
-                valid_mask = depth_map > 0
-                points = points[valid_mask]
-                
-                # Get colors for point cloud
-                colors = rgb_frame[valid_mask] / 255.0
-                
-                # Log point cloud
-                rr.log("world/depth/point_cloud",
-                      rr.Points3D(points, colors=colors, radii=0.01))
-                
-                # 3. Log depth statistics
-                valid_depths = depth_map[depth_map > 0]
-                if len(valid_depths) > 0:
-                    stats = {
-                        "min": np.min(valid_depths),
-                        "max": np.max(valid_depths),
-                        "mean": np.mean(valid_depths),
-                        "std": np.std(valid_depths)
-                    }
-                    
-                    for stat_name, value in stats.items():
-                        rr.log(f"world/depth/stats/{stat_name}",
-                              rr.Scalar(value))
-            
-            frame_count += 1
-            
-            # Optional: progress indicator
-            if frame_count % 10 == 0:
-                print(f"Processed {frame_count} frames")
+        print(f"\nDepth data saved to: {depth_file_path}")
+        return depth_file_path
 
 def main():
-    # Replace with your spatial video path
-    VIDEO_PATH = "IMG_6540.MOV"
+    parser = argparse.ArgumentParser(description='Extract depth data from iPhone spatial video')
+    parser.add_argument('video_path', help='Path to the spatial video file')
+    args = parser.parse_args()
     
-    # Create extractor
-    extractor = iPhoneSpatialVideoExtractor(VIDEO_PATH)
+    extractor = DepthExtractor(args.video_path)
+    depth_file_path = extractor.extract()
     
-    # Extract and visualize frames
-    extractor.extract_frames()
-
 if __name__ == "__main__":
     main()
